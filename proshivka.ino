@@ -11,7 +11,7 @@
 #define WIFI_SSID_ADDR 10
 #define WIFI_PASS_ADDR 50
 #define NEWS_URL_ADDR 90
-#define EGG_SCORE_ADDR 170  // Новый адрес для счёта Egg
+#define EGG_SCORE_ADDR 170
 
 #define APP_COUNT 9
 String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "WiFi", "Accel", "News", "Egg", "Settings", "Themes"};
@@ -69,11 +69,11 @@ String savedSSID = "";
 String savedPass = "";
 bool wifiAutoConnectStarted = false;
 
-// Клавиатура (6x6)
+// Клавиатура (4x10 = 40 символов, ПОЛНАЯ)
 String password = "";
-String keyboardChars = "1234567890qwertyuiopasdfghjklzxc.:/";
+String keyboardChars = "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM.:/";
 int keyIndex = 0;
-const int keysPerRow = 6;
+const int keysPerRow = 10;
 unsigned long bPressStart = 0;
 bool bLongPressActive = false;
 unsigned long aPressStart = 0;
@@ -187,7 +187,6 @@ void loadNewsURL() {
     if(strlen(url) > 0) newsURL = String(url);
 }
 
-// Сохранение и загрузка счёта Egg
 void saveEggScore(int score) {
     EEPROM.write(EGG_SCORE_ADDR, score & 0xFF);
     EEPROM.write(EGG_SCORE_ADDR + 1, (score >> 8) & 0xFF);
@@ -426,7 +425,7 @@ void drawSettings() {
     M5.Lcd.println("B=Listat'  A=Vybrat'");
 }
 
-// ---------- NEWS URL INPUT ----------
+// ---------- NEWS URL INPUT (ПОЛНАЯ КЛАВИАТУРА 4x10) ----------
 void drawNewsURLInput() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -436,26 +435,26 @@ void drawNewsURLInput() {
     M5.Lcd.println(newsURL);
     M5.Lcd.println("");
     
-    int startX = 10;
+    int startX = 5;
     int startY = 45;
-    int btnW = 34;
+    int btnW = 22;
     int btnH = 14;
-    int cols = 6;
+    int cols = 10;
     
     for(int i = 0; i < keyboardChars.length(); i++) {
         int row = i / cols;
         int col = i % cols;
-        int x = startX + col * (btnW + 2);
-        int y = startY + row * (btnH + 2);
+        int x = startX + col * (btnW + 1);
+        int y = startY + row * (btnH + 1);
         
-        if(y > 100) continue;
+        if(y > 105) continue;
         
         if(i == keyIndex) {
             M5.Lcd.fillRect(x-1, y-1, btnW+2, btnH+2, TFT_YELLOW);
         }
         M5.Lcd.fillRect(x, y, btnW, btnH, TFT_DARKGRAY);
         M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.setCursor(x + 12, y + 3);
+        M5.Lcd.setCursor(x + 5, y + 3);
         M5.Lcd.print(keyboardChars[i]);
     }
     
@@ -584,26 +583,26 @@ void drawPasswordInput() {
     M5.Lcd.print("Pass: ");
     M5.Lcd.println(password);
     
-    int startX = 10;
+    int startX = 5;
     int startY = 45;
-    int btnW = 34;
+    int btnW = 22;
     int btnH = 14;
-    int cols = 6;
+    int cols = 10;
     
     for(int i = 0; i < keyboardChars.length(); i++) {
         int row = i / cols;
         int col = i % cols;
-        int x = startX + col * (btnW + 2);
-        int y = startY + row * (btnH + 2);
+        int x = startX + col * (btnW + 1);
+        int y = startY + row * (btnH + 1);
         
-        if(y > 100) continue;
+        if(y > 105) continue;
         
         if(i == keyIndex) {
             M5.Lcd.fillRect(x-1, y-1, btnW+2, btnH+2, TFT_YELLOW);
         }
         M5.Lcd.fillRect(x, y, btnW, btnH, TFT_DARKGRAY);
         M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.setCursor(x + 12, y + 3);
+        M5.Lcd.setCursor(x + 5, y + 3);
         M5.Lcd.print(keyboardChars[i]);
     }
     
@@ -633,7 +632,7 @@ void drawWiFiConnecting() {
     M5.Lcd.println("B=Nazad");
 }
 
-// ---------- EGG CLICKER (СОХРАНЕНИЕ SCORE) ----------
+// ---------- EGG CLICKER ----------
 void resetEgg() {
     eggScore = 0;
     eggCracked = false;
@@ -835,13 +834,13 @@ void setup() {
     currentTheme = loadTheme();
     loadWiFiCredentials();
     loadNewsURL();
-    eggScore = loadEggScore();  // Загружаем сохранённый счёт
+    eggScore = loadEggScore();
     
     initRTC();
     
     bootSplash();
     resetGame();
-    eggCracked = false;  // Яйцо всегда целое при старте
+    eggCracked = false;
     locked = true;
     drawLockScreen();
     currentScreen = SCREEN_LOCK;
@@ -918,7 +917,7 @@ void loop() {
         }
     }
     
-    // ЛЕНТА (ВХОД БЕЗ ЗАДЕРЖКИ)
+    // ЛЕНТА
     if(currentScreen == 0) {
         if(bShort) {
             currentApp = (currentApp + 1) % APP_COUNT;
@@ -1023,10 +1022,10 @@ void loop() {
         }
     }
     
-    // EGG CLICKER (С СОХРАНЕНИЕМ)
+    // EGG CLICKER
     if(currentScreen == 8) {
         if(bShort) { 
-            saveEggScore(eggScore);  // Сохраняем при выходе
+            saveEggScore(eggScore);
             currentScreen = 0; 
             screenEnterTime = millis(); 
             drawAppRibbon(); 
@@ -1036,7 +1035,7 @@ void loop() {
         if(!eggCracked) {
             if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) {
                 eggScore++;
-                saveEggScore(eggScore);  // Сохраняем после каждого разбития
+                saveEggScore(eggScore);
                 eggCracked = true;
                 drawEgg();
                 lastActivity = millis();
