@@ -5,15 +5,16 @@
 #include <ArduinoJson.h>
 #include "time.h"
 
+// ---------- НАСТРОЙКИ ----------
 #define EEPROM_SIZE 256
 #define THEME_ADDR 0
 #define WIFI_SSID_ADDR 10
 #define WIFI_PASS_ADDR 50
 #define NEWS_URL_ADDR 90
+#define EGG_SCORE_ADDR 170  // Новый адрес для счёта Egg
 
-// ---------- НАСТРОЙКИ ОС ----------
-#define APP_COUNT 8
-String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "WiFi", "Accel", "News", "Settings", "Themes"};
+#define APP_COUNT 9
+String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "WiFi", "Accel", "News", "Egg", "Settings", "Themes"};
 int currentApp = 0;
 
 // Темы (5 тем)
@@ -30,14 +31,19 @@ bool gameOver = false;
 unsigned long lastMove = 0;
 int gameSpeed = 200;
 
+// Для Egg Clicker
+int eggScore = 0;
+bool eggCracked = false;
+
 // Состояния
 int currentScreen = 0;
 int settingsPos = 0;
-#define SETTINGS_COUNT 5
-String settingsMenu[SETTINGS_COUNT] = {"Yarkost", "GMT", "News URL", "O Sisteme", "Nazad"};
+#define SETTINGS_COUNT 4
+String settingsMenu[SETTINGS_COUNT] = {"Yarkost", "GMT", "News URL", "Nazad"};
 int brightness = 100;
 int gmtOffset = 3;
 String newsURL = "http://192.168.1.100:8080/news.json";
+unsigned long screenEnterTime = 0;
 
 // Для выключения
 bool pwrHeld = false;
@@ -49,7 +55,6 @@ bool pwrForKeyboard = false;
 // Блокировка
 bool locked = true;
 unsigned long lastActivity = 0;
-
 #define SCREEN_LOCK 99
 
 // WiFi состояние
@@ -64,15 +69,16 @@ String savedSSID = "";
 String savedPass = "";
 bool wifiAutoConnectStarted = false;
 
-// Клавиатура
+// Клавиатура (6x6)
 String password = "";
-String keyboardChars = "1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM.:/_-";
+String keyboardChars = "1234567890qwertyuiopasdfghjklzxc.:/";
 int keyIndex = 0;
-const int keysPerRow = 10;
+const int keysPerRow = 6;
 unsigned long bPressStart = 0;
 bool bLongPressActive = false;
 unsigned long aPressStart = 0;
 bool aLongPressActive = false;
+unsigned long aRepeatTimer = 0;
 
 // Новости
 String newsContent = "";
@@ -82,6 +88,10 @@ bool newsLoading = false;
 
 // NTP сервер
 const char* ntpServer = "pool.ntp.org";
+
+// Время
+unsigned long lastTimeSync = 0;
+bool rtcInitialized = false;
 
 // Флаг для принудительной перерисовки
 bool needFullRedraw = false;
@@ -177,6 +187,23 @@ void loadNewsURL() {
     if(strlen(url) > 0) newsURL = String(url);
 }
 
+// Сохранение и загрузка счёта Egg
+void saveEggScore(int score) {
+    EEPROM.write(EGG_SCORE_ADDR, score & 0xFF);
+    EEPROM.write(EGG_SCORE_ADDR + 1, (score >> 8) & 0xFF);
+    EEPROM.write(EGG_SCORE_ADDR + 2, (score >> 16) & 0xFF);
+    EEPROM.write(EGG_SCORE_ADDR + 3, (score >> 24) & 0xFF);
+    EEPROM.commit();
+}
+
+int loadEggScore() {
+    int score = EEPROM.read(EGG_SCORE_ADDR);
+    score |= EEPROM.read(EGG_SCORE_ADDR + 1) << 8;
+    score |= EEPROM.read(EGG_SCORE_ADDR + 2) << 16;
+    score |= EEPROM.read(EGG_SCORE_ADDR + 3) << 24;
+    return score;
+}
+
 void autoConnectWiFi() {
     if(savedSSID.length() > 0 && !wifiConnected && !wifiAutoConnectStarted) {
         wifiAutoConnectStarted = true;
@@ -184,7 +211,7 @@ void autoConnectWiFi() {
     }
 }
 
-// ---------- СИНХРОНИЗАЦИЯ ВРЕМЕНИ ----------
+// ---------- СИНХРОНИЗАЦИЯ ВРЕМЕНИ (ТОЛЬКО ПО WiFi) ----------
 void syncTime() {
     if(wifiConnected) {
         configTime(gmtOffset * 3600, 0, ntpServer);
@@ -192,7 +219,15 @@ void syncTime() {
         if(getLocalTime(&timeinfo)) {
             M5.Rtc.setDateTime(&timeinfo);
             timeSynced = true;
+            rtcInitialized = true;
         }
+    }
+}
+
+void initRTC() {
+    if(!rtcInitialized) {
+        M5.Rtc.setDateTime({{2026, 4, 12}, {12 + gmtOffset, 0, 0}});
+        rtcInitialized = true;
     }
 }
 
@@ -261,7 +296,7 @@ void drawLockScreen() {
     drawThemeBackground(currentTheme, true);
     
     auto dt = M5.Rtc.getDateTime();
-    int hour = (dt.time.hours + gmtOffset) % 24;
+    int hour = dt.time.hours;
     
     uint16_t textColor = getTextColor(currentTheme);
     M5.Lcd.setTextColor(textColor);
@@ -294,7 +329,7 @@ void drawAppRibbon() {
     M5.Lcd.print("WInESP");
     
     auto dt = M5.Rtc.getDateTime();
-    int hour = (dt.time.hours + gmtOffset) % 24;
+    int hour = dt.time.hours;
     M5.Lcd.setTextSize(1);
     M5.Lcd.setCursor(120, 5);
     M5.Lcd.printf("%02d:%02d GMT+%d", hour, dt.time.minutes, gmtOffset);
@@ -330,7 +365,8 @@ void drawAppRibbon() {
         else if(i == 3) col = TFT_BLUE;
         else if(i == 4) col = TFT_PURPLE;
         else if(i == 5) col = TFT_YELLOW;
-        else if(i == 6) col = TFT_DARKGRAY;
+        else if(i == 6) col = TFT_GREEN;
+        else if(i == 7) col = TFT_DARKGRAY;
         else col = TFT_MAGENTA;
         
         M5.Lcd.fillRoundRect(x, y, 50, 50, 8, col);
@@ -399,8 +435,32 @@ void drawNewsURLInput() {
     M5.Lcd.println("News URL:");
     M5.Lcd.println(newsURL);
     M5.Lcd.println("");
-    M5.Lcd.println("A:Next B:Add PWR:Del");
-    M5.Lcd.println("HoldB:Save");
+    
+    int startX = 10;
+    int startY = 45;
+    int btnW = 34;
+    int btnH = 14;
+    int cols = 6;
+    
+    for(int i = 0; i < keyboardChars.length(); i++) {
+        int row = i / cols;
+        int col = i % cols;
+        int x = startX + col * (btnW + 2);
+        int y = startY + row * (btnH + 2);
+        
+        if(y > 100) continue;
+        
+        if(i == keyIndex) {
+            M5.Lcd.fillRect(x-1, y-1, btnW+2, btnH+2, TFT_YELLOW);
+        }
+        M5.Lcd.fillRect(x, y, btnW, btnH, TFT_DARKGRAY);
+        M5.Lcd.setTextColor(TFT_WHITE);
+        M5.Lcd.setCursor(x + 12, y + 3);
+        M5.Lcd.print(keyboardChars[i]);
+    }
+    
+    M5.Lcd.setCursor(0, 115);
+    M5.Lcd.println("A:Next B:Add PWR:Del HoldB:Save");
 }
 
 // ---------- О СИСТЕМЕ ----------
@@ -524,17 +584,17 @@ void drawPasswordInput() {
     M5.Lcd.print("Pass: ");
     M5.Lcd.println(password);
     
-    int startX = 5;
+    int startX = 10;
     int startY = 45;
-    int btnW = 22;
+    int btnW = 34;
     int btnH = 14;
-    int cols = 10;
+    int cols = 6;
     
     for(int i = 0; i < keyboardChars.length(); i++) {
         int row = i / cols;
         int col = i % cols;
-        int x = startX + col * (btnW + 1);
-        int y = startY + row * (btnH + 1);
+        int x = startX + col * (btnW + 2);
+        int y = startY + row * (btnH + 2);
         
         if(y > 100) continue;
         
@@ -543,7 +603,7 @@ void drawPasswordInput() {
         }
         M5.Lcd.fillRect(x, y, btnW, btnH, TFT_DARKGRAY);
         M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.setCursor(x + 5, y + 3);
+        M5.Lcd.setCursor(x + 12, y + 3);
         M5.Lcd.print(keyboardChars[i]);
     }
     
@@ -571,6 +631,34 @@ void drawWiFiConnecting() {
     
     M5.Lcd.setCursor(0, 125);
     M5.Lcd.println("B=Nazad");
+}
+
+// ---------- EGG CLICKER (СОХРАНЕНИЕ SCORE) ----------
+void resetEgg() {
+    eggScore = 0;
+    eggCracked = false;
+    saveEggScore(eggScore);
+}
+
+void drawEgg() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.printf("Score: %d", eggScore);
+    
+    if(!eggCracked) {
+        M5.Lcd.fillCircle(120, 70, 25, TFT_WHITE);
+        M5.Lcd.fillCircle(115, 60, 8, TFT_YELLOW);
+        M5.Lcd.setCursor(0, 125);
+        M5.Lcd.println("A=Razbit'  B=Vyhod");
+    } else {
+        M5.Lcd.fillCircle(110, 70, 15, TFT_WHITE);
+        M5.Lcd.fillCircle(130, 70, 15, TFT_WHITE);
+        M5.Lcd.fillCircle(120, 80, 10, TFT_YELLOW);
+        M5.Lcd.setCursor(0, 125);
+        M5.Lcd.println("A=Novoe  B=Vyhod");
+    }
 }
 
 // ---------- НОВОСТИ ----------
@@ -688,9 +776,8 @@ void moveSnake() {
     }
 }
 
-// ---------- ТАЙМЕР ВЫКЛЮЧЕНИЯ (НЕ РАБОТАЕТ В WIFI) ----------
+// ---------- ТАЙМЕР ВЫКЛЮЧЕНИЯ ----------
 void checkPowerOff() {
-    // В режиме ввода пароля или выбора WiFi таймер выключения полностью отключён
     if(pwrForKeyboard) return;
     
     if(M5.BtnPWR.isPressed()) {
@@ -748,9 +835,13 @@ void setup() {
     currentTheme = loadTheme();
     loadWiFiCredentials();
     loadNewsURL();
+    eggScore = loadEggScore();  // Загружаем сохранённый счёт
+    
+    initRTC();
     
     bootSplash();
     resetGame();
+    eggCracked = false;  // Яйцо всегда целое при старте
     locked = true;
     drawLockScreen();
     currentScreen = SCREEN_LOCK;
@@ -766,6 +857,11 @@ void loop() {
     
     bool bShort = isBShortPressed();
     
+    if(millis() - lastTimeSync > 3600000) {
+        if(wifiConnected) syncTime();
+        lastTimeSync = millis();
+    }
+    
     if(needFullRedraw) {
         needFullRedraw = false;
         if(currentScreen == 0) drawAppRibbon();
@@ -780,17 +876,18 @@ void loop() {
         }
         else if(currentScreen == 6) drawAccel();
         else if(currentScreen == 7) drawNews();
+        else if(currentScreen == 8) drawEgg();
         else if(currentScreen == 9) drawSettings();
         else if(currentScreen == 10) drawThemes();
         else if(currentScreen == 11) drawAbout();
         else if(currentScreen == 12) drawNewsURLInput();
     }
     
-    // ЭКРАН БЛОКИРОВКИ
     if(locked) {
         if(M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
             locked = false;
             currentScreen = 0;
+            screenEnterTime = millis();
             drawAppRibbon();
             lastActivity = millis();
             autoConnectWiFi();
@@ -804,7 +901,6 @@ void loop() {
         return;
     }
     
-    // Авто-подключение WiFi
     if(wifiAutoConnectStarted && !wifiConnected) {
         if(WiFi.status() == WL_CONNECTED) {
             wifiConnected = true;
@@ -822,7 +918,7 @@ void loop() {
         }
     }
     
-    // ЛЕНТА
+    // ЛЕНТА (ВХОД БЕЗ ЗАДЕРЖКИ)
     if(currentScreen == 0) {
         if(bShort) {
             currentApp = (currentApp + 1) % APP_COUNT;
@@ -830,234 +926,188 @@ void loop() {
             lastActivity = millis();
         }
         if(M5.BtnA.wasPressed()) {
-            if(currentApp == 0) { currentScreen = 1; drawInfo(); }
-            else if(currentApp == 1) { currentScreen = 3; drawBat(); }
-            else if(currentApp == 2) { currentScreen = 4; resetGame(); drawGame(); }
+            if(currentApp == 0) { currentScreen = 1; screenEnterTime = millis(); drawInfo(); }
+            else if(currentApp == 1) { currentScreen = 3; screenEnterTime = millis(); drawBat(); }
+            else if(currentApp == 2) { currentScreen = 4; resetGame(); drawGame(); screenEnterTime = millis(); }
             else if(currentApp == 3) { 
                 currentScreen = 5; 
+                screenEnterTime = millis();
                 wifiState = 0;
                 scanWiFiNetworks();
                 drawWiFiScanner();
             }
-            else if(currentApp == 4) { currentScreen = 6; drawAccel(); }
+            else if(currentApp == 4) { currentScreen = 6; drawAccel(); screenEnterTime = millis(); }
             else if(currentApp == 5) { 
                 currentScreen = 7; 
+                screenEnterTime = millis();
                 newsContent = "";
                 fetchNews();
                 drawNews();
             }
-            else if(currentApp == 6) { currentScreen = 9; settingsPos = 0; drawSettings(); }
-            else if(currentApp == 7) { currentScreen = 10; drawThemes(); }
+            else if(currentApp == 6) { currentScreen = 8; eggCracked = false; drawEgg(); screenEnterTime = millis(); }
+            else if(currentApp == 7) { 
+                currentScreen = 9; 
+                screenEnterTime = millis();
+                settingsPos = 0; 
+                drawSettings(); 
+            }
+            else if(currentApp == 8) { 
+                currentScreen = 10; 
+                screenEnterTime = millis();
+                drawThemes(); 
+            }
             lastActivity = millis();
         }
     }
     
     // WiFi
-    else if(currentScreen == 5) {
-        // Включаем защиту от выключения
+    if(currentScreen == 5) {
         pwrForKeyboard = true;
         
         if(wifiState == 0) {
-            if(M5.BtnPWR.wasPressed()) {
-                currentScreen = 0;
-                drawAppRibbon();
-                lastActivity = millis();
-            }
-            if(M5.BtnA.wasPressed()) {
-                wifiState = 1;
-                selectedNetwork = 0;
-                drawWiFiSelect();
-                lastActivity = millis();
-            }
+            if(M5.BtnPWR.wasPressed()) { currentScreen = 0; screenEnterTime = millis(); drawAppRibbon(); lastActivity = millis(); }
+            if(M5.BtnA.wasPressed()) { wifiState = 1; selectedNetwork = 0; drawWiFiSelect(); lastActivity = millis(); }
         }
         else if(wifiState == 1) {
-            if(M5.BtnPWR.wasPressed()) {
-                wifiState = 0;
-                drawWiFiScanner();
-                lastActivity = millis();
-            }
-            if(M5.BtnA.wasPressed()) {
-                wifiState = 2;
-                password = "";
-                keyIndex = 0;
-                drawPasswordInput();
-                lastActivity = millis();
-            }
-            if(bShort) {
-                selectedNetwork = (selectedNetwork + 1) % min(numNetworks, 8);
-                drawWiFiSelect();
-                lastActivity = millis();
-            }
+            if(M5.BtnPWR.wasPressed()) { wifiState = 0; drawWiFiScanner(); lastActivity = millis(); }
+            if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) { wifiState = 2; password = ""; keyIndex = 0; drawPasswordInput(); lastActivity = millis(); }
+            if(bShort) { selectedNetwork = (selectedNetwork + 1) % min(numNetworks, 8); drawWiFiSelect(); lastActivity = millis(); }
             if(M5.BtnA.isPressed()) {
                 if(aPressStart == 0) aPressStart = millis();
                 if(!aLongPressActive && millis() - aPressStart > 500) {
-                    aLongPressActive = true;
+                    aLongPressActive = true; aRepeatTimer = millis();
                     selectedNetwork = (selectedNetwork - 1 + min(numNetworks, 8)) % min(numNetworks, 8);
-                    drawWiFiSelect();
-                    lastActivity = millis();
+                    drawWiFiSelect(); lastActivity = millis();
                 }
-            } else {
-                aPressStart = 0;
-                aLongPressActive = false;
-            }
+                if(aLongPressActive && millis() - aRepeatTimer > 150) {
+                    aRepeatTimer = millis();
+                    selectedNetwork = (selectedNetwork - 1 + min(numNetworks, 8)) % min(numNetworks, 8);
+                    drawWiFiSelect(); lastActivity = millis();
+                }
+            } else { aPressStart = 0; aLongPressActive = false; }
         }
         else if(wifiState == 2) {
-            if(M5.BtnPWR.wasPressed()) {
-                if(password.length() > 0) {
-                    password = password.substring(0, password.length() - 1);
-                }
-                drawPasswordInput();
-                lastActivity = millis();
-            }
-            
-            if(M5.BtnA.wasPressed()) {
-                keyIndex = (keyIndex + 1) % keyboardChars.length();
-                drawPasswordInput();
-                lastActivity = millis();
-            }
-            
+            if(M5.BtnPWR.wasPressed()) { if(password.length() > 0) password = password.substring(0, password.length() - 1); drawPasswordInput(); lastActivity = millis(); }
+            if(M5.BtnA.wasPressed()) { keyIndex = (keyIndex + 1) % keyboardChars.length(); drawPasswordInput(); lastActivity = millis(); }
             if(M5.BtnA.isPressed()) {
                 if(aPressStart == 0) aPressStart = millis();
                 if(!aLongPressActive && millis() - aPressStart > 500) {
-                    aLongPressActive = true;
+                    aLongPressActive = true; aRepeatTimer = millis();
                     keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
-                    drawPasswordInput();
-                    lastActivity = millis();
+                    drawPasswordInput(); lastActivity = millis();
                 }
-            } else {
-                aPressStart = 0;
-                aLongPressActive = false;
-            }
+                if(aLongPressActive && millis() - aRepeatTimer > 150) {
+                    aRepeatTimer = millis();
+                    keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
+                    drawPasswordInput(); lastActivity = millis();
+                }
+            } else { aPressStart = 0; aLongPressActive = false; }
             
             if(M5.BtnB.isPressed()) {
-                if(bPressStart == 0) {
-                    bPressStart = millis();
-                    bLongPressActive = false;
-                } else if(!bLongPressActive && millis() - bPressStart > 1000) {
-                    bLongPressActive = true;
-                    wifiState = 3;
-                    drawWiFiConnecting();
-                    wifiStatusTime = millis();
+                if(bPressStart == 0) { bPressStart = millis(); bLongPressActive = false; }
+                else if(!bLongPressActive && millis() - bPressStart > 1000) {
+                    bLongPressActive = true; wifiState = 3; drawWiFiConnecting(); wifiStatusTime = millis();
                     WiFi.begin(networkSSIDs[selectedNetwork].c_str(), password.c_str());
                     saveWiFiCredentials(networkSSIDs[selectedNetwork], password);
                     lastActivity = millis();
                 }
             } else {
-                if(bPressStart > 0 && !bLongPressActive) {
-                    password += keyboardChars[keyIndex];
-                    drawPasswordInput();
-                    lastActivity = millis();
-                }
-                bPressStart = 0;
-                bLongPressActive = false;
+                if(bPressStart > 0 && !bLongPressActive) { password += keyboardChars[keyIndex]; drawPasswordInput(); lastActivity = millis(); }
+                bPressStart = 0; bLongPressActive = false;
             }
         }
         else {
-            if(bShort) {
-                wifiState = 0;
-                drawWiFiScanner();
-                lastActivity = millis();
-            }
-            if(WiFi.status() == WL_CONNECTED && !wifiConnected) {
-                wifiConnected = true;
-                drawWiFiConnecting();
-                syncTime();
-            }
-            if(millis() - wifiStatusTime > 15000 && !wifiConnected) {
-                wifiState = 0;
-                drawWiFiScanner();
-            }
+            if(M5.BtnPWR.wasPressed()) { wifiState = 0; drawWiFiScanner(); lastActivity = millis(); }
+            if(WiFi.status() == WL_CONNECTED && !wifiConnected) { wifiConnected = true; drawWiFiConnecting(); syncTime(); }
+            if(millis() - wifiStatusTime > 15000 && !wifiConnected) { wifiState = 0; drawWiFiScanner(); }
         }
     }
-    else {
-        // Выключаем защиту от выключения
-        pwrForKeyboard = false;
+    
+    // EGG CLICKER (С СОХРАНЕНИЕМ)
+    if(currentScreen == 8) {
+        if(bShort) { 
+            saveEggScore(eggScore);  // Сохраняем при выходе
+            currentScreen = 0; 
+            screenEnterTime = millis(); 
+            drawAppRibbon(); 
+            lastActivity = millis(); 
+        }
+        
+        if(!eggCracked) {
+            if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) {
+                eggScore++;
+                saveEggScore(eggScore);  // Сохраняем после каждого разбития
+                eggCracked = true;
+                drawEgg();
+                lastActivity = millis();
+            }
+        } else {
+            if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) {
+                eggCracked = false;
+                drawEgg();
+                lastActivity = millis();
+            }
+        }
     }
     
     // NEWS URL INPUT
     if(currentScreen == 12) {
         pwrForKeyboard = true;
-        if(M5.BtnPWR.wasPressed()) {
-            if(newsURL.length() > 0) {
-                newsURL = newsURL.substring(0, newsURL.length() - 1);
+        if(M5.BtnPWR.wasPressed()) { if(newsURL.length() > 0) newsURL = newsURL.substring(0, newsURL.length() - 1); drawNewsURLInput(); lastActivity = millis(); }
+        if(M5.BtnA.wasPressed()) { keyIndex = (keyIndex + 1) % keyboardChars.length(); drawNewsURLInput(); lastActivity = millis(); }
+        if(M5.BtnA.isPressed()) {
+            if(aPressStart == 0) aPressStart = millis();
+            if(!aLongPressActive && millis() - aPressStart > 500) {
+                aLongPressActive = true; aRepeatTimer = millis();
+                keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
+                drawNewsURLInput(); lastActivity = millis();
             }
-            drawNewsURLInput();
-            lastActivity = millis();
-        }
-        
-        if(M5.BtnA.wasPressed()) {
-            keyIndex = (keyIndex + 1) % keyboardChars.length();
-            drawNewsURLInput();
-            lastActivity = millis();
-        }
+            if(aLongPressActive && millis() - aRepeatTimer > 150) {
+                aRepeatTimer = millis();
+                keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
+                drawNewsURLInput(); lastActivity = millis();
+            }
+        } else { aPressStart = 0; aLongPressActive = false; }
         
         if(M5.BtnB.isPressed()) {
-            if(bPressStart == 0) {
-                bPressStart = millis();
-                bLongPressActive = false;
-            } else if(!bLongPressActive && millis() - bPressStart > 1000) {
-                bLongPressActive = true;
-                saveNewsURL(newsURL);
-                currentScreen = 9;
-                drawSettings();
-                lastActivity = millis();
+            if(bPressStart == 0) { bPressStart = millis(); bLongPressActive = false; }
+            else if(!bLongPressActive && millis() - bPressStart > 1000) {
+                bLongPressActive = true; saveNewsURL(newsURL); currentScreen = 9; drawSettings(); lastActivity = millis();
             }
         } else {
-            if(bPressStart > 0 && !bLongPressActive) {
-                newsURL += keyboardChars[keyIndex];
-                drawNewsURLInput();
-                lastActivity = millis();
-            }
-            bPressStart = 0;
-            bLongPressActive = false;
+            if(bPressStart > 0 && !bLongPressActive) { newsURL += keyboardChars[keyIndex]; drawNewsURLInput(); lastActivity = millis(); }
+            bPressStart = 0; bLongPressActive = false;
         }
     }
     
     // НОВОСТИ
     if(currentScreen == 7) {
-        if(bShort) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-        }
-        if(M5.BtnA.wasPressed()) {
-            newsContent = "";
-            fetchNews();
-            drawNews();
-            lastActivity = millis();
-        }
+        if(bShort) { currentScreen = 0; screenEnterTime = millis(); drawAppRibbon(); lastActivity = millis(); }
+        if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) { newsContent = ""; fetchNews(); drawNews(); lastActivity = millis(); }
         if(M5.BtnB.isPressed()) {
             static unsigned long lastScroll = 0;
-            if(millis() - lastScroll > 200) {
-                newsScroll++;
-                drawNews();
-                lastScroll = millis();
-                lastActivity = millis();
-            }
+            if(millis() - lastScroll > 200) { newsScroll++; drawNews(); lastScroll = millis(); lastActivity = millis(); }
         }
-        if(millis() - lastNewsScroll > 3000) {
-            newsScroll++;
-            drawNews();
-            lastNewsScroll = millis();
-        }
+        if(millis() - lastNewsScroll > 3000) { newsScroll++; drawNews(); lastNewsScroll = millis(); }
     }
     
     // ТЕМЫ
     if(currentScreen == 10) {
-        if(M5.BtnPWR.wasPressed()) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-            return;
-        }
         if(bShort) {
             currentTheme = (currentTheme + 1) % THEME_COUNT;
             saveTheme(currentTheme);
             drawThemes();
             lastActivity = millis();
         }
-        if(M5.BtnA.wasPressed()) {
+        if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) {
             currentScreen = 0;
+            screenEnterTime = millis();
+            drawAppRibbon();
+            lastActivity = millis();
+        }
+        if(M5.BtnPWR.wasPressed()) {
+            currentScreen = 0;
+            screenEnterTime = millis();
             drawAppRibbon();
             lastActivity = millis();
         }
@@ -1065,18 +1115,9 @@ void loop() {
     
     // НАСТРОЙКИ
     if(currentScreen == 9) {
-        if(M5.BtnPWR.wasPressed()) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-            return;
-        }
-        if(bShort) {
-            settingsPos = (settingsPos + 1) % SETTINGS_COUNT;
-            drawSettings();
-            lastActivity = millis();
-        }
-        if(M5.BtnA.wasPressed()) {
+        if(M5.BtnPWR.wasPressed()) { currentScreen = 0; screenEnterTime = millis(); drawAppRibbon(); lastActivity = millis(); return; }
+        if(bShort) { settingsPos = (settingsPos + 1) % SETTINGS_COUNT; drawSettings(); lastActivity = millis(); }
+        if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 1000) {
             if(settingsPos == 0) {
                 brightness = (brightness + 10) % 110;
                 M5.Lcd.setBrightness(brightness);
@@ -1091,66 +1132,28 @@ void loop() {
                 keyIndex = 0;
                 drawNewsURLInput();
             } else if(settingsPos == 3) {
-                currentScreen = 11;
-                drawAbout();
-            } else if(settingsPos == 4) {
                 currentScreen = 0;
+                screenEnterTime = millis();
                 drawAppRibbon();
             }
             lastActivity = millis();
         }
     }
     
-    // О СИСТЕМЕ
-    if(currentScreen == 11) {
-        if(bShort) {
-            currentScreen = 9;
-            drawSettings();
-            lastActivity = millis();
-        }
-    }
-    
-    // ИНФО
-    if(currentScreen == 1) {
-        if(bShort) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-        }
-    }
-    
-    // БАТАРЕЯ / ACCEL
-    if(currentScreen == 3 || currentScreen == 6) {
-        if(bShort) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-        }
+    // ИНФО / БАТАРЕЯ / ACCEL
+    if(currentScreen == 1 || currentScreen == 3 || currentScreen == 6) {
+        if(bShort) { currentScreen = 0; screenEnterTime = millis(); drawAppRibbon(); lastActivity = millis(); }
     }
     
     // SNAKE
     if(currentScreen == 4) {
-        if(bShort) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-        }
-        if(!gameOver && millis() - lastMove > gameSpeed) {
-            moveSnake();
-            drawGame();
-            lastMove = millis();
-        }
-        if(M5.BtnA.wasPressed()) {
-            dir = (dir + 1) % 4;
-            lastActivity = millis();
-        }
+        if(bShort) { currentScreen = 0; screenEnterTime = millis(); drawAppRibbon(); lastActivity = millis(); }
+        if(!gameOver && millis() - lastMove > gameSpeed) { moveSnake(); drawGame(); lastMove = millis(); }
+        if(M5.BtnA.wasPressed()) { dir = (dir + 1) % 4; lastActivity = millis(); }
     }
     
     // АКСЕЛЕРОМЕТР
-    if(currentScreen == 6) {
-        drawAccel();
-        delay(50);
-    }
+    if(currentScreen == 6) { drawAccel(); delay(50); }
     
     // ОБНОВЛЕНИЕ НА РАБОЧЕМ СТОЛЕ
     if(currentScreen == 0) {
@@ -1158,24 +1161,15 @@ void loop() {
         static int lastMin = -1;
         int bat = M5.Power.getBatteryLevel();
         auto dt = M5.Rtc.getDateTime();
-        
-        if(bat != lastBat || dt.time.minutes != lastMin) {
-            drawAppRibbon();
-            lastBat = bat;
-            lastMin = dt.time.minutes;
-        }
+        if(bat != lastBat || dt.time.minutes != lastMin) { drawAppRibbon(); lastBat = bat; lastMin = dt.time.minutes; }
     }
     
     // АВТОБЛОКИРОВКА
-    if(millis() - lastActivity > 30000 && !locked) {
-        locked = true;
-        currentScreen = SCREEN_LOCK;
-        drawLockScreen();
-    }
+    if(millis() - lastActivity > 30000 && !locked) { locked = true; currentScreen = SCREEN_LOCK; drawLockScreen(); }
     
-    if(M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnPWR.wasPressed()) {
-        lastActivity = millis();
-    }
+    if(M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnPWR.wasPressed()) lastActivity = millis();
+    
+    if(currentScreen != 5 && currentScreen != 12) pwrForKeyboard = false;
     
     delay(15);
 }
