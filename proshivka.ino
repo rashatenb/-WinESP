@@ -1,8 +1,6 @@
 #include <M5StickCPlus2.h>
 #include <WiFi.h>
 #include <EEPROM.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 #include "time.h"
 
 // ---------- ЗВУКИ (НЕБЛОКИРУЮЩИЕ) ----------
@@ -42,21 +40,34 @@ bool tonePlaying = false;
 #define THEME_ADDR 0
 #define WIFI_SSID_ADDR 10
 #define WIFI_PASS_ADDR 70
-#define NEWS_URL_ADDR 130
-#define EGG_SCORE_ADDR 210
-#define WIFI_SAVED_FLAG_ADDR 250
-#define GMT_OFFSET_ADDR 251
-#define SNAKE_HIGHSCORE_ADDR 260
-#define FLAPPY_HIGHSCORE_ADDR 264
+#define EGG_SCORE_ADDR 130
+#define WIFI_SAVED_FLAG_ADDR 170
+#define GMT_OFFSET_ADDR 171
+#define SNAKE_HIGHSCORE_ADDR 180
+#define FLAPPY_HIGHSCORE_ADDR 184
 
 #define APP_COUNT 11
-String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "Flappy", "Egg", "WiFi", "Accel", "News", "Power", "Settings", "Themes"};
+String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "Flappy", "Egg", "WiFi", "Accel", "Radio", "Power", "Settings", "Themes"};
 int currentApp = 0;
 
 // Темы (5 тем)
 int currentTheme = 0;
 #define THEME_COUNT 5
 String themeNames[THEME_COUNT] = {"Standart", "Temnaya", "Poloski", "Volny", "Kuby"};
+
+// ---------- ИНТЕРНЕТ-РАДИО (ЗАГЛУШКА) ----------
+#define RADIO_STATIONS_COUNT 5
+String radioStations[RADIO_STATIONS_COUNT] = {
+    "DFM 101.2",
+    "Europa Plus",
+    "Retro FM",
+    "Radio Record",
+    "Russkoe Radio"
+};
+
+int currentStation = 0;
+bool radioPlaying = false;
+String radioStatus = "Stopped";
 
 // ---------- ЗМЕЙКА ----------
 int snakeX[200], snakeY[200];
@@ -109,11 +120,18 @@ unsigned long lastEggAnim = 0;
 int currentScreen = 0;
 int settingsPos = 0;
 #define SETTINGS_COUNT 4
-String settingsMenu[SETTINGS_COUNT] = {"Yarkost", "GMT", "News URL", "Nazad"};
+String settingsMenu[SETTINGS_COUNT] = {"Yarkost", "GMT", "Vremya", "Nazad"};
 int brightness = 100;
 int gmtOffset = 3;
-String newsURL = "http://192.168.1.100:8080/news.json";
 unsigned long screenEnterTime = 0;
+
+// Ручная установка времени
+int setHour = 12;
+int setMinute = 0;
+int setDay = 1;
+int setMonth = 1;
+int setYear = 2025;
+int timeEditMode = 0;
 
 // Для выключения
 bool pwrHeld = false;
@@ -151,13 +169,6 @@ unsigned long aPressStart = 0;
 bool aLongPressActive = false;
 unsigned long aRepeatTimer = 0;
 
-// Новости
-String newsContent = "";
-int newsScroll = 0;
-unsigned long lastNewsScroll = 0;
-bool newsLoading = false;
-bool newsFirstLoad = true;
-
 // NTP серверы
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
@@ -175,7 +186,13 @@ String powerMenuItems[POWER_MENU_COUNT] = {"Reboot", "Power Off", "Deep Sleep", 
 // Флаг для принудительной перерисовки
 bool needFullRedraw = false;
 
-// ---------- НЕБЛОКИРУЮЩИЕ ФУНКЦИИ ЗВУКА ----------
+// ---------- НЕБЛОКИРУЮЩИЕ ФУНКЦИИ ЗВУКА (С ГЛУШЕНИЕМ УСИЛИТЕЛЯ) ----------
+void silenceSpeaker() {
+    ledcDetach(SPEAKER_PIN);
+    pinMode(SPEAKER_PIN, OUTPUT);
+    digitalWrite(SPEAKER_PIN, LOW);
+}
+
 void queueSound(int freq, int duration) {
     if(queueCount < MAX_SOUND_QUEUE) {
         soundQueue[queueCount][0] = freq;
@@ -185,8 +202,9 @@ void queueSound(int freq, int duration) {
 }
 
 void playToneAsync(int freq, int duration) {
+    silenceSpeaker();
     if(freq > 0) {
-        tone(SPEAKER_PIN, freq, duration);
+        M5.Speaker.tone(freq, duration);
     }
     toneEndTime = millis() + duration;
     tonePlaying = true;
@@ -194,7 +212,8 @@ void playToneAsync(int freq, int duration) {
 
 void updateSound() {
     if(tonePlaying && millis() > toneEndTime) {
-        noTone(SPEAKER_PIN);
+        M5.Speaker.end();
+        silenceSpeaker();
         tonePlaying = false;
     }
 }
@@ -207,6 +226,7 @@ void playNextInQueue() {
     if(currentSound >= queueCount && !tonePlaying) {
         queueCount = 0;
         currentSound = 0;
+        silenceSpeaker();
     }
 }
 
@@ -391,23 +411,6 @@ void loadWiFiCredentials() {
     }
 }
 
-void saveNewsURL(String url) {
-    for(int i = 0; i < 80; i++) {
-        EEPROM.write(NEWS_URL_ADDR + i, i < url.length() ? url[i] : 0);
-    }
-    EEPROM.commit();
-}
-
-void loadNewsURL() {
-    char url[80] = {0};
-    for(int i = 0; i < 80; i++) {
-        url[i] = EEPROM.read(NEWS_URL_ADDR + i);
-    }
-    if(strlen(url) > 0 && url[0] == 'h') {
-        newsURL = String(url);
-    }
-}
-
 void saveEggScore(int score) {
     EEPROM.write(EGG_SCORE_ADDR, score & 0xFF);
     EEPROM.write(EGG_SCORE_ADDR + 1, (score >> 8) & 0xFF);
@@ -437,7 +440,7 @@ void loadGMTOffset() {
     }
 }
 
-// ---------- ВРЕМЯ ----------
+// ---------- ВРЕМЯ (ПРОСТОЕ RTC) ----------
 bool isLeapYear(int year) {
     return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
 }
@@ -601,68 +604,232 @@ void initRTC() {
     }
 }
 
-void fetchNews() {
-    if(!wifiConnected) {
-        newsContent = "> WiFi ne podklyuchen!\n  Zaydi v WiFi prilozhenie\n\n";
-        return;
-    }
+// ---------- РУЧНАЯ УСТАНОВКА ВРЕМЕНИ ----------
+void drawSetTime() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(50, 10);
+    M5.Lcd.println("SET TIME");
     
-    if(newsLoading) return;
+    M5.Lcd.drawLine(10, 35, 230, 35, TFT_DARKGRAY);
     
-    newsLoading = true;
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(40, 50);
+    if(timeEditMode == 0) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", setHour);
     
-    HTTPClient http;
-    http.begin(newsURL);
-    http.setTimeout(8000);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setCursor(80, 50);
+    M5.Lcd.print(":");
     
-    int httpCode = http.GET();
+    M5.Lcd.setCursor(100, 50);
+    if(timeEditMode == 1) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", setMinute);
     
-    if(httpCode > 0) {
-        if(httpCode == 200) {
-            String payload = http.getString();
-            
-            DynamicJsonDocument doc(8192);
-            DeserializationError error = deserializeJson(doc, payload);
-            
-            if(!error) {
-                JsonArray items = doc["news"].as<JsonArray>();
-                int newsCount = items.size();
-                
-                if(newsCount == 0) {
-                    newsContent = "> Net novostei\n  Dobav'te ih na servere\n\n";
-                } else {
-                    newsContent = "";
-                    for(JsonVariant item : items) {
-                        const char* title = item["title"];
-                        const char* date = item["date"];
-                        
-                        if(title && date) {
-                            newsContent += "> ";
-                            newsContent += String(title);
-                            newsContent += "\n  ";
-                            newsContent += String(date);
-                            newsContent += "\n\n";
-                        }
-                    }
-                }
-            } else {
-                newsContent = "> Oshibka JSON\n  ";
-                newsContent += error.c_str();
-                newsContent += "\n\n";
-            }
-        } else {
-            newsContent = "> Server nedostupen\n  Kod: " + String(httpCode) + "\n\n";
-        }
-    } else {
-        newsContent = "> Oshibka podklyucheniya\n  " + http.errorToString(httpCode) + "\n\n";
-    }
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(30, 85);
+    if(timeEditMode == 2) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", setDay);
     
-    http.end();
-    newsLoading = false;
-    newsScroll = 0;
-    newsFirstLoad = false;
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.print("/");
+    
+    if(timeEditMode == 3) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", setMonth);
+    
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.print("/");
+    
+    if(timeEditMode == 4) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%04d", setYear);
+    
+    M5.Lcd.setTextColor(TFT_DARKGRAY);
+    M5.Lcd.setCursor(5, 115);
+    M5.Lcd.println("A: +1  B: Next");
+    M5.Lcd.setCursor(5, 125);
+    M5.Lcd.println("PWR: Save  HoldA: -1");
 }
 
+void setTimeManually() {
+    auto now = getLocalDateTime();
+    setHour = now.time.hours;
+    setMinute = now.time.minutes;
+    setDay = now.date.date;
+    setMonth = now.date.month;
+    setYear = now.date.year;
+    timeEditMode = 0;
+    
+    drawSetTime();
+    
+    while(true) {
+        M5.update();
+        updateSound();
+        playNextInQueue();
+        
+        if(M5.BtnPWR.wasPressed()) {
+            int utcHour = setHour - gmtOffset;
+            int dayOffset = 0;
+            while(utcHour < 0) {
+                utcHour += 24;
+                dayOffset--;
+            }
+            
+            m5::rtc_datetime_t dt;
+            dt.date.year = setYear;
+            dt.date.month = setMonth;
+            dt.date.date = setDay;
+            dt.time.hours = utcHour;
+            dt.time.minutes = setMinute;
+            dt.time.seconds = 0;
+            
+            if(dayOffset < 0) {
+                dt.date.date--;
+                if(dt.date.date < 1) {
+                    dt.date.month--;
+                    if(dt.date.month < 1) {
+                        dt.date.month = 12;
+                        dt.date.year--;
+                    }
+                    dt.date.date = daysInMonth(dt.date.month, dt.date.year);
+                }
+            }
+            
+            M5.Rtc.setDateTime(&dt);
+            timeSynced = false;
+            
+            playUnlockSound();
+            break;
+        }
+        
+        if(M5.BtnB.wasPressed()) {
+            timeEditMode = (timeEditMode + 1) % 5;
+            drawSetTime();
+            playClickSound();
+        }
+        
+        if(M5.BtnA.wasPressed()) {
+            if(timeEditMode == 0) {
+                setHour = (setHour + 1) % 24;
+            } else if(timeEditMode == 1) {
+                setMinute = (setMinute + 1) % 60;
+            } else if(timeEditMode == 2) {
+                setDay++;
+                if(setDay > daysInMonth(setMonth, setYear)) setDay = 1;
+            } else if(timeEditMode == 3) {
+                setMonth++;
+                if(setMonth > 12) setMonth = 1;
+                if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+            } else if(timeEditMode == 4) {
+                setYear++;
+                if(setYear > 2099) setYear = 2025;
+                if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+            }
+            drawSetTime();
+            playClickSound();
+        }
+        
+        if(M5.BtnA.isPressed()) {
+            if(aPressStart == 0) aPressStart = millis();
+            if(!aLongPressActive && millis() - aPressStart > 500) {
+                aLongPressActive = true;
+                aRepeatTimer = millis();
+                
+                if(timeEditMode == 0) {
+                    setHour = (setHour - 1 + 24) % 24;
+                } else if(timeEditMode == 1) {
+                    setMinute = (setMinute - 1 + 60) % 60;
+                } else if(timeEditMode == 2) {
+                    setDay--;
+                    if(setDay < 1) setDay = daysInMonth(setMonth, setYear);
+                } else if(timeEditMode == 3) {
+                    setMonth--;
+                    if(setMonth < 1) setMonth = 12;
+                    if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+                } else if(timeEditMode == 4) {
+                    setYear--;
+                    if(setYear < 2025) setYear = 2099;
+                    if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+                }
+                drawSetTime();
+            }
+            if(aLongPressActive && millis() - aRepeatTimer > 150) {
+                aRepeatTimer = millis();
+                
+                if(timeEditMode == 0) {
+                    setHour = (setHour - 1 + 24) % 24;
+                } else if(timeEditMode == 1) {
+                    setMinute = (setMinute - 1 + 60) % 60;
+                } else if(timeEditMode == 2) {
+                    setDay--;
+                    if(setDay < 1) setDay = daysInMonth(setMonth, setYear);
+                } else if(timeEditMode == 3) {
+                    setMonth--;
+                    if(setMonth < 1) setMonth = 12;
+                    if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+                } else if(timeEditMode == 4) {
+                    setYear--;
+                    if(setYear < 2025) setYear = 2099;
+                    if(setDay > daysInMonth(setMonth, setYear)) setDay = daysInMonth(setMonth, setYear);
+                }
+                drawSetTime();
+            }
+        } else {
+            aPressStart = 0;
+            aLongPressActive = false;
+        }
+        
+        delay(15);
+    }
+}
+
+// ---------- РАДИО (ЗАГЛУШКА) ----------
+void drawRadio() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(50, 10);
+    M5.Lcd.println("📻 RADIO");
+    
+    M5.Lcd.drawLine(10, 35, 230, 35, TFT_DARKGRAY);
+    
+    if(!wifiConnected) {
+        M5.Lcd.setTextColor(TFT_RED);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.setCursor(20, 60);
+        M5.Lcd.println("WiFi not connected!");
+        M5.Lcd.setCursor(20, 75);
+        M5.Lcd.println("Connect to WiFi first");
+    } else {
+        M5.Lcd.setTextColor(TFT_GREEN);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.setCursor(10, 50);
+        M5.Lcd.println("Station:");
+        
+        M5.Lcd.setTextColor(TFT_YELLOW);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(20, 70);
+        M5.Lcd.println(radioStations[currentStation]);
+        
+        M5.Lcd.setTextColor(TFT_WHITE);
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.setCursor(10, 105);
+        M5.Lcd.println("Status: " + radioStatus);
+        
+        M5.Lcd.setTextColor(TFT_DARKGRAY);
+        M5.Lcd.setCursor(5, 120);
+        M5.Lcd.println("A: Play  B: Next");
+        M5.Lcd.setCursor(5, 130);
+        M5.Lcd.println("PWR: Exit");
+    }
+}
+
+// ---------- ЗАСТАВКА ----------
 void bootSplash() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -688,6 +855,7 @@ void bootSplash() {
     delay(500);
 }
 
+// ---------- ЭКРАН БЛОКИРОВКИ ----------
 void drawLockScreen() {
     drawThemeBackground(currentTheme, true);
     
@@ -719,6 +887,7 @@ void drawLockScreen() {
     }
 }
 
+// ---------- ЛЕНТА ----------
 void drawAppRibbon() {
     drawThemeBackground(currentTheme, false);
     
@@ -765,9 +934,9 @@ void drawAppRibbon() {
         else if(i == 4) col = TFT_YELLOW;
         else if(i == 5) col = TFT_BLUE;
         else if(i == 6) col = TFT_PURPLE;
-        else if(i == 7) col = TFT_DARKGRAY;
+        else if(i == 7) col = TFT_MAGENTA;
         else if(i == 8) col = TFT_RED;
-        else if(i == 9) col = TFT_MAGENTA;
+        else if(i == 9) col = TFT_DARKGRAY;
         else col = TFT_CYAN;
         
         M5.Lcd.fillRoundRect(x, y, 50, 50, 8, col);
@@ -784,6 +953,7 @@ void drawAppRibbon() {
     M5.Lcd.print("< B > = Listat'  A = Zapusk  PWR(2.5s) = Vyk");
 }
 
+// ---------- ТЕМЫ ----------
 void drawThemes() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -803,6 +973,7 @@ void drawThemes() {
     M5.Lcd.println("B=Listat'  A=Vybrat'");
 }
 
+// ---------- НАСТРОЙКИ ----------
 void drawSettings() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -825,42 +996,7 @@ void drawSettings() {
     M5.Lcd.println("B=Listat'  A=Vybrat'");
 }
 
-void drawNewsURLInput() {
-    M5.Lcd.fillScreen(TFT_BLACK);
-    M5.Lcd.setTextColor(TFT_WHITE);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("News URL:");
-    M5.Lcd.println(newsURL);
-    M5.Lcd.println("");
-    
-    int startX = 5;
-    int startY = 45;
-    int btnW = 22;
-    int btnH = 14;
-    int cols = 10;
-    
-    for(int i = 0; i < keyboardChars.length(); i++) {
-        int row = i / cols;
-        int col = i % cols;
-        int x = startX + col * (btnW + 1);
-        int y = startY + row * (btnH + 1);
-        
-        if(y > 105) continue;
-        
-        if(i == keyIndex) {
-            M5.Lcd.fillRect(x-1, y-1, btnW+2, btnH+2, TFT_YELLOW);
-        }
-        M5.Lcd.fillRect(x, y, btnW, btnH, TFT_DARKGRAY);
-        M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.setCursor(x + 5, y + 3);
-        M5.Lcd.print(keyboardChars[i]);
-    }
-    
-    M5.Lcd.setCursor(0, 115);
-    M5.Lcd.println("A:Next B:Add PWR:Del HoldB:Save");
-}
-
+// ---------- ИНФО ----------
 void drawInfo() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -907,6 +1043,7 @@ void drawInfo() {
     M5.Lcd.println("<< B = Nazad >>");
 }
 
+// ---------- БАТАРЕЯ ----------
 void drawBat() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -924,6 +1061,7 @@ void drawBat() {
     M5.Lcd.println("<< B = Nazad >>");
 }
 
+// ---------- WIFI СКАНЕР ----------
 void scanWiFiNetworks() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -1041,6 +1179,7 @@ void drawWiFiConnecting() {
     M5.Lcd.println("B=Nazad");
 }
 
+// ---------- EGG CLICKER ----------
 void drawEgg() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -1071,48 +1210,7 @@ void drawEgg() {
     }
 }
 
-void drawNews() {
-    M5.Lcd.fillScreen(TFT_BLACK);
-    M5.Lcd.setTextColor(TFT_WHITE);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("=== NOVOSTI ===");
-    
-    if(!wifiConnected) {
-        M5.Lcd.setTextColor(TFT_RED);
-        M5.Lcd.setCursor(0, 12);
-        M5.Lcd.println("WiFi otklyuchen!");
-        M5.Lcd.setTextColor(TFT_WHITE);
-    }
-    
-    if(newsContent.length() == 0) {
-        M5.Lcd.setCursor(0, 25);
-        M5.Lcd.println("Zagruzka novostei...");
-    } else {
-        int y = 20;
-        int startLine = newsScroll;
-        int lineCount = 0;
-        String temp = "";
-        
-        for(int i = 0; i < newsContent.length(); i++) {
-            temp += newsContent[i];
-            if(newsContent[i] == '\n') {
-                if(lineCount >= startLine) {
-                    M5.Lcd.setCursor(0, y);
-                    M5.Lcd.print(temp);
-                    y += 12;
-                    if(y > 120) break;
-                }
-                temp = "";
-                lineCount++;
-            }
-        }
-    }
-    
-    M5.Lcd.setCursor(0, 125);
-    M5.Lcd.println("A=Obnovit'  B=Nazad");
-}
-
+// ---------- АКСЕЛЕРОМЕТР ----------
 void drawAccel() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -1170,7 +1268,6 @@ void drawPowerMenu() {
         else M5.Lcd.print("↩ Back");
     }
     
-    // Информация о батарее
     M5.Lcd.setTextColor(TFT_GREEN);
     M5.Lcd.setCursor(10, 120);
     M5.Lcd.printf("Battery: %d%%", M5.Power.getBatteryLevel());
@@ -1553,7 +1650,7 @@ void flappyJump() {
     }
 }
 
-// ---------- ТАЙМЕР ВЫКЛЮЧЕНИЯ ----------
+// ---------- ТАЙМЕР ВЫКЛЮЧЕНИЯ (ИСПРАВЛЕН) ----------
 void checkPowerOff() {
     if(pwrForKeyboard) return;
     
@@ -1614,7 +1711,6 @@ void setup() {
     
     currentTheme = loadTheme();
     loadWiFiCredentials();
-    loadNewsURL();
     eggScore = loadEggScore();
     loadGMTOffset();
     snakeHighScore = loadSnakeHighScore();
@@ -1671,7 +1767,7 @@ void loop() {
     updateSound();
     playNextInQueue();
     
-    if(pwrHeld) return;
+    if(shuttingDown) return;
     
     bool bShort = isBShortPressed();
     
@@ -1695,11 +1791,10 @@ void loop() {
             else drawWiFiConnecting();
         }
         else if(currentScreen == 7) drawAccel();
-        else if(currentScreen == 8) drawNews();
+        else if(currentScreen == 8) drawRadio();
         else if(currentScreen == 9) drawPowerMenu();
         else if(currentScreen == 10) drawSettings();
         else if(currentScreen == 11) drawThemes();
-        else if(currentScreen == 13) drawNewsURLInput();
     }
     
     // ЭКРАН БЛОКИРОВКИ
@@ -1742,7 +1837,7 @@ void loop() {
             lastActivity = millis();
         }
         
-        if(M5.BtnPWR.wasPressed()) {
+        if(M5.BtnPWR.wasPressed() && !pwrHeld) {
             currentScreen = 0;
             drawAppRibbon();
             lastActivity = millis();
@@ -1773,23 +1868,10 @@ void loop() {
             }
             else if(currentApp == 6) { currentScreen = 7; drawAccel(); }
             else if(currentApp == 7) { 
-                currentScreen = 8; 
-                newsContent = "";
-                newsFirstLoad = true;
-                newsScroll = 0;
-                
-                if(!wifiConnected && savedSSID.length() > 0) {
-                    M5.Lcd.fillScreen(TFT_BLACK);
-                    M5.Lcd.setCursor(0, 20);
-                    M5.Lcd.println("Podklyucheniye k WiFi...");
-                    if(connectToSavedWiFi()) {
-                        M5.Lcd.println("Podklyucheno!");
-                        delay(500);
-                    }
-                }
-                
-                fetchNews();
-                drawNews();
+                currentScreen = 8;
+                radioPlaying = false;
+                radioStatus = "Stopped";
+                drawRadio();
             }
             else if(currentApp == 8) { 
                 currentScreen = 9; 
@@ -1801,6 +1883,49 @@ void loop() {
             
             screenEnterTime = millis();
             lastActivity = millis();
+        }
+    }
+    
+    // РАДИО (С ИСПРАВЛЕННЫМ ВЫХОДОМ)
+    if(currentScreen == 8) {
+        pwrForKeyboard = false;  // ← ОТКЛЮЧАЕМ ТАЙМЕР ВЫКЛЮЧЕНИЯ!
+        
+        if(!wifiConnected) {
+            M5.Lcd.setTextColor(TFT_RED);
+            M5.Lcd.setTextSize(1);
+            M5.Lcd.setCursor(20, 60);
+            M5.Lcd.println("WiFi not connected!");
+        }
+        
+        if(bShort) {
+            currentStation = (currentStation + 1) % RADIO_STATIONS_COUNT;
+            radioStatus = "Stopped";
+            radioPlaying = false;
+            drawRadio();
+            playClickSound();
+            lastActivity = millis();
+        }
+        
+        if(M5.BtnA.wasPressed()) {
+            if(!radioPlaying) {
+                radioPlaying = true;
+                radioStatus = "Playing (demo)";
+            } else {
+                radioPlaying = false;
+                radioStatus = "Stopped";
+            }
+            drawRadio();
+            playClickSound();
+            lastActivity = millis();
+        }
+        
+        // Выход по PWR (короткое нажатие)
+        if(M5.BtnPWR.wasPressed()) {
+            radioPlaying = false;
+            currentScreen = 0;
+            drawAppRibbon();
+            lastActivity = millis();
+            pwrHeld = false;  // ← СБРАСЫВАЕМ ФЛАГ ДОЛГОГО НАЖАТИЯ
         }
     }
     
@@ -1898,11 +2023,11 @@ void loop() {
         pwrForKeyboard = true;
         
         if(wifiState == 0) {
-            if(M5.BtnPWR.wasPressed()) { currentScreen = 0; drawAppRibbon(); }
+            if(M5.BtnPWR.wasPressed() && !pwrHeld) { currentScreen = 0; drawAppRibbon(); }
             if(M5.BtnA.wasPressed()) { wifiState = 1; selectedNetwork = 0; drawWiFiSelect(); playClickSound(); }
         }
         else if(wifiState == 1) {
-            if(M5.BtnPWR.wasPressed()) { wifiState = 0; drawWiFiScanner(); }
+            if(M5.BtnPWR.wasPressed() && !pwrHeld) { wifiState = 0; drawWiFiScanner(); }
             if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 500) { 
                 wifiState = 2; 
                 password = ""; 
@@ -1934,7 +2059,7 @@ void loop() {
             }
         }
         else if(wifiState == 2) {
-            if(M5.BtnPWR.wasPressed()) { 
+            if(M5.BtnPWR.wasPressed() && !pwrHeld) { 
                 if(password.length() > 0) password = password.substring(0, password.length() - 1); 
                 drawPasswordInput(); 
                 playClickSound();
@@ -1990,7 +2115,7 @@ void loop() {
             }
         }
         else if(wifiState == 3) {
-            if(M5.BtnPWR.wasPressed()) { 
+            if(M5.BtnPWR.wasPressed() && !pwrHeld) { 
                 wifiState = 0; 
                 wifiErrorMessage = "";
                 drawWiFiScanner(); 
@@ -2028,89 +2153,6 @@ void loop() {
         }
         
         lastActivity = millis();
-    }
-    
-    // NEWS URL INPUT
-    if(currentScreen == 13) {
-        pwrForKeyboard = true;
-        if(M5.BtnPWR.wasPressed()) { 
-            if(newsURL.length() > 0) newsURL = newsURL.substring(0, newsURL.length() - 1); 
-            drawNewsURLInput(); 
-            playClickSound();
-        }
-        if(M5.BtnA.wasPressed()) { 
-            keyIndex = (keyIndex + 1) % keyboardChars.length(); 
-            drawNewsURLInput(); 
-            playClickSound();
-        }
-        if(M5.BtnA.isPressed()) {
-            if(aPressStart == 0) aPressStart = millis();
-            if(!aLongPressActive && millis() - aPressStart > 500) {
-                aLongPressActive = true; 
-                aRepeatTimer = millis();
-                keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
-                drawNewsURLInput();
-            }
-            if(aLongPressActive && millis() - aRepeatTimer > 150) {
-                aRepeatTimer = millis();
-                keyIndex = (keyIndex - 1 + keyboardChars.length()) % keyboardChars.length();
-                drawNewsURLInput();
-            }
-        } else { 
-            aPressStart = 0; 
-            aLongPressActive = false; 
-        }
-        
-        if(M5.BtnB.isPressed()) {
-            if(bPressStart == 0) { 
-                bPressStart = millis(); 
-                bLongPressActive = false; 
-            }
-            else if(!bLongPressActive && millis() - bPressStart > 800) {
-                bLongPressActive = true; 
-                saveNewsURL(newsURL); 
-                currentScreen = 10; 
-                drawSettings();
-                playUnlockSound();
-            }
-        } else {
-            if(bPressStart > 0 && !bLongPressActive) { 
-                newsURL += keyboardChars[keyIndex]; 
-                drawNewsURLInput(); 
-                playClickSound();
-            }
-            bPressStart = 0; 
-            bLongPressActive = false;
-        }
-        lastActivity = millis();
-    }
-    
-    // НОВОСТИ
-    if(currentScreen == 8) {
-        if(bShort) { 
-            currentScreen = 0; 
-            drawAppRibbon(); 
-            lastActivity = millis();
-        }
-        
-        if(M5.BtnA.wasPressed() && millis() - screenEnterTime > 500) { 
-            newsContent = "";
-            newsFirstLoad = true;
-            newsScroll = 0;
-            fetchNews(); 
-            drawNews(); 
-            lastActivity = millis();
-        }
-        
-        if(M5.BtnB.isPressed()) {
-            static unsigned long lastScrollPress = 0;
-            if(millis() - lastScrollPress > 200) { 
-                newsScroll++; 
-                drawNews(); 
-                lastScrollPress = millis(); 
-                lastActivity = millis();
-            }
-        }
     }
     
     // ТЕМЫ
@@ -2151,7 +2193,7 @@ void loop() {
     
     // НАСТРОЙКИ
     if(currentScreen == 10) {
-        if(M5.BtnPWR.wasPressed()) { 
+        if(M5.BtnPWR.wasPressed() && !pwrHeld) { 
             currentScreen = 0; 
             drawAppRibbon(); 
             lastActivity = millis();
@@ -2196,9 +2238,9 @@ void loop() {
                 
                 if(currentScreen == 0) drawAppRibbon();
             } else if(settingsPos == 2) {
-                currentScreen = 13;
-                keyIndex = 0;
-                drawNewsURLInput();
+                setTimeManually();
+                currentScreen = 10;
+                drawSettings();
             } else if(settingsPos == 3) {
                 currentScreen = 0;
                 drawAppRibbon();
@@ -2246,7 +2288,7 @@ void loop() {
         lastActivity = millis();
     }
     
-    if(currentScreen != 6 && currentScreen != 13) pwrForKeyboard = false;
+    if(currentScreen != 6) pwrForKeyboard = false;
     
     delay(15);
 }
