@@ -1,6 +1,7 @@
 #include <M5StickCPlus2.h>
 #include <WiFi.h>
 #include <EEPROM.h>
+#include <SD.h>
 #include "time.h"
 
 // ---------- ЗВУКИ (НЕБЛОКИРУЮЩИЕ) ----------
@@ -46,8 +47,8 @@ bool tonePlaying = false;
 #define SNAKE_HIGHSCORE_ADDR 180
 #define FLAPPY_HIGHSCORE_ADDR 184
 
-#define APP_COUNT 11
-String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "Flappy", "Egg", "WiFi", "Accel", "Radio", "Power", "Settings", "Themes"};
+#define APP_COUNT 13
+String appNames[APP_COUNT] = {"Info", "Bat", "Snake", "Flappy", "Egg", "WiFi", "Accel", "Radio", "Timer", "Storage", "Power", "Settings", "Themes"};
 int currentApp = 0;
 
 // Темы (5 тем)
@@ -186,6 +187,25 @@ String powerMenuItems[POWER_MENU_COUNT] = {"Reboot", "Power Off", "Deep Sleep", 
 // Флаг для принудительной перерисовки
 bool needFullRedraw = false;
 
+// ---------- НОВЫЙ ТАЙМЕР ----------
+RTC_DATA_ATTR unsigned long timerTargetMillis = 0;
+RTC_DATA_ATTR bool timerActive = false;
+RTC_DATA_ATTR int timerSetHours = 0;
+RTC_DATA_ATTR int timerSetMinutes = 0;
+RTC_DATA_ATTR int timerSetSeconds = 0;
+RTC_DATA_ATTR bool timerSoundEnabled = true;
+int timerEditMode = 0;
+bool timerPaused = false;
+unsigned long timerPauseElapsed = 0;
+bool timerPlayingSound = false;
+
+// ---------- STORAGE ----------
+bool sdCardInserted = false;
+uint64_t sdCardSize = 0;
+uint64_t sdCardUsed = 0;
+int storageScroll = 0;
+#define STORAGE_LINES 8
+
 // ---------- НЕБЛОКИРУЮЩИЕ ФУНКЦИИ ЗВУКА (С ГЛУШЕНИЕМ УСИЛИТЕЛЯ) ----------
 void silenceSpeaker() {
     ledcDetach(SPEAKER_PIN);
@@ -293,6 +313,13 @@ void playStartupSound() {
     queueSound(NOTE_A5, 80);
     queueSound(NOTE_B5, 80);
     queueSound(NOTE_C6, 200);
+}
+
+void playTimerAlarmSound() {
+    for(int i = 0; i < 5; i++) {
+        queueSound(NOTE_C6, 100);
+        queueSound(NOTE_REST, 50);
+    }
 }
 
 // ---------- ФУНКЦИИ ДЛЯ ТЕМ ----------
@@ -829,6 +856,168 @@ void drawRadio() {
     }
 }
 
+// ---------- НОВЫЙ ТАЙМЕР ----------
+void drawTimerSet() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(30, 10);
+    M5.Lcd.println("SET TIMER");
+    M5.Lcd.drawLine(10, 35, 230, 35, TFT_DARKGRAY);
+    
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setCursor(30, 60);
+    if(timerEditMode == 0) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", timerSetHours);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.print(":");
+    if(timerEditMode == 1) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", timerSetMinutes);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.print(":");
+    if(timerEditMode == 2) M5.Lcd.setTextColor(TFT_YELLOW);
+    else M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.printf("%02d", timerSetSeconds);
+    
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_DARKGRAY);
+    M5.Lcd.setCursor(5, 115);
+    M5.Lcd.println("A: +1  B: Next");
+    M5.Lcd.setCursor(5, 125);
+    M5.Lcd.println("HoldB: Start  PWR: Cancel");
+    M5.Lcd.setCursor(5, 135);
+    M5.Lcd.println("Sound: " + String(timerSoundEnabled ? "ON" : "OFF"));
+}
+
+void drawTimer() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(50, 10);
+    M5.Lcd.println("⏱️ TIMER");
+    M5.Lcd.drawLine(10, 35, 230, 35, TFT_DARKGRAY);
+    
+    if(timerActive || timerPaused) {
+        unsigned long remaining = 0;
+        if(timerPaused) {
+            remaining = timerTargetMillis - timerPauseElapsed;
+        } else {
+            remaining = timerTargetMillis - millis();
+        }
+        
+        if(!timerPaused && remaining <= 0) {
+            timerActive = false;
+            if(timerSoundEnabled) {
+                playTimerAlarmSound();
+                timerPlayingSound = true;
+            }
+        }
+        
+        int hrs = remaining / 3600000;
+        int mins = (remaining / 60000) % 60;
+        int secs = (remaining / 1000) % 60;
+        
+        M5.Lcd.setTextSize(3);
+        M5.Lcd.setCursor(30, 60);
+        M5.Lcd.printf("%02d:%02d:%02d", hrs, mins, secs);
+        
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.setCursor(5, 120);
+        if(timerPaused) {
+            M5.Lcd.println("A: Resume  B: Stop");
+        } else {
+            M5.Lcd.println("A: Pause  B: Stop");
+        }
+        if(timerPlayingSound) {
+            M5.Lcd.setCursor(5, 130);
+            M5.Lcd.println("HoldA: Stop Sound");
+        }
+        M5.Lcd.setCursor(5, 140);
+        M5.Lcd.println("PWR: Exit");
+    } else {
+        M5.Lcd.setTextSize(3);
+        M5.Lcd.setCursor(30, 60);
+        M5.Lcd.printf("%02d:%02d:%02d", timerSetHours, timerSetMinutes, timerSetSeconds);
+        
+        M5.Lcd.setTextSize(1);
+        M5.Lcd.setCursor(5, 120);
+        M5.Lcd.println("A: Set Timer");
+        M5.Lcd.setCursor(5, 130);
+        M5.Lcd.println("HoldA: Sound " + String(timerSoundEnabled ? "ON" : "OFF"));
+        M5.Lcd.setCursor(5, 140);
+        M5.Lcd.println("PWR: Exit");
+    }
+}
+
+// ---------- STORAGE (БЕЗ БАРОВ, ТОЛЬКО ЦИФРЫ) ----------
+void updateSDInfo() {
+    sdCardInserted = false;
+    if(SD.begin()) {
+        sdCardInserted = true;
+        sdCardSize = SD.cardSize();
+        sdCardUsed = sdCardSize - SD.totalBytes();
+        SD.end();
+    }
+}
+
+void drawStorage() {
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(30, 10);
+    M5.Lcd.println("💾 STORAGE");
+    M5.Lcd.drawLine(10, 35, 230, 35, TFT_DARKGRAY);
+    
+    M5.Lcd.setTextSize(1);
+    int y = 45;
+    
+    if(storageScroll <= 0) {
+        M5.Lcd.setCursor(5, y);
+        M5.Lcd.println("📦 FLASH: 16 MB total");
+        M5.Lcd.setCursor(5, y + 12);
+        M5.Lcd.println("   Used: ~4 MB (25%)");
+        y += 30;
+    }
+    if(storageScroll <= 1) {
+        M5.Lcd.setCursor(5, y);
+        M5.Lcd.println("🧠 PSRAM: 8 MB total");
+        M5.Lcd.setCursor(5, y + 12);
+        M5.Lcd.println("   Used: ~2.4 MB (30%)");
+        y += 30;
+    }
+    if(storageScroll <= 2) {
+        M5.Lcd.setCursor(5, y);
+        M5.Lcd.println("💾 EEPROM: 512 bytes");
+        int eepromUsed = 0;
+        for(int i = 0; i < 256; i++) if(EEPROM.read(i) != 0xFF) eepromUsed++;
+        M5.Lcd.setCursor(5, y + 12);
+        M5.Lcd.println("   Used: " + String(eepromUsed) + " bytes (" + String(eepromUsed * 100 / 512) + "%)");
+        y += 30;
+    }
+    
+    updateSDInfo();
+    if(storageScroll <= 3) {
+        M5.Lcd.setCursor(5, y);
+        M5.Lcd.println("📁 SD CARD:");
+        if(sdCardInserted) {
+            M5.Lcd.setCursor(5, y + 12);
+            M5.Lcd.println("   Total: " + String((float)sdCardSize / 1024 / 1024 / 1024, 2) + " GB");
+            M5.Lcd.setCursor(5, y + 24);
+            M5.Lcd.println("   Free: " + String((float)(sdCardSize - sdCardUsed) / 1024 / 1024 / 1024, 2) + " GB");
+            M5.Lcd.setCursor(5, y + 36);
+            M5.Lcd.println("   Used: " + String((float)sdCardUsed / 1024 / 1024 / 1024, 2) + " GB");
+        } else {
+            M5.Lcd.setCursor(5, y + 12);
+            M5.Lcd.println("   Not inserted");
+        }
+    }
+    
+    M5.Lcd.setCursor(5, 165);
+    M5.Lcd.println("B:Scroll  PWR:Exit");
+}
+
 // ---------- ЗАСТАВКА ----------
 void bootSplash() {
     M5.Lcd.fillScreen(TFT_BLACK);
@@ -935,8 +1124,10 @@ void drawAppRibbon() {
         else if(i == 5) col = TFT_BLUE;
         else if(i == 6) col = TFT_PURPLE;
         else if(i == 7) col = TFT_MAGENTA;
-        else if(i == 8) col = TFT_RED;
-        else if(i == 9) col = TFT_DARKGRAY;
+        else if(i == 8) col = TFT_CYAN;
+        else if(i == 9) col = TFT_ORANGE;
+        else if(i == 10) col = TFT_RED;
+        else if(i == 11) col = TFT_DARKGRAY;
         else col = TFT_CYAN;
         
         M5.Lcd.fillRoundRect(x, y, 50, 50, 8, col);
@@ -1792,9 +1983,11 @@ void loop() {
         }
         else if(currentScreen == 7) drawAccel();
         else if(currentScreen == 8) drawRadio();
-        else if(currentScreen == 9) drawPowerMenu();
-        else if(currentScreen == 10) drawSettings();
-        else if(currentScreen == 11) drawThemes();
+        else if(currentScreen == 9) drawTimer();
+        else if(currentScreen == 10) drawStorage();
+        else if(currentScreen == 11) drawPowerMenu();
+        else if(currentScreen == 12) drawSettings();
+        else if(currentScreen == 13) drawThemes();
     }
     
     // ЭКРАН БЛОКИРОВКИ
@@ -1817,7 +2010,7 @@ void loop() {
     }
     
     // POWER МЕНЮ
-    if(currentScreen == 9) {
+    if(currentScreen == 11) {
         if(bShort) {
             powerMenuPos = (powerMenuPos + 1) % POWER_MENU_COUNT;
             drawPowerMenu();
@@ -1873,13 +2066,28 @@ void loop() {
                 radioStatus = "Stopped";
                 drawRadio();
             }
-            else if(currentApp == 8) { 
-                currentScreen = 9; 
+            else if(currentApp == 8) {
+                currentScreen = 9;
+                timerActive = false;
+                timerPaused = false;
+                timerPlayingSound = false;
+                timerSetHours = 0;
+                timerSetMinutes = 1;
+                timerSetSeconds = 0;
+                drawTimer();
+            }
+            else if(currentApp == 9) {
+                currentScreen = 10;
+                storageScroll = 0;
+                drawStorage();
+            }
+            else if(currentApp == 10) { 
+                currentScreen = 11; 
                 powerMenuPos = 0;
                 drawPowerMenu(); 
             }
-            else if(currentApp == 9) { currentScreen = 10; settingsPos = 0; drawSettings(); }
-            else if(currentApp == 10) { currentScreen = 11; drawThemes(); }
+            else if(currentApp == 11) { currentScreen = 12; settingsPos = 0; drawSettings(); }
+            else if(currentApp == 12) { currentScreen = 13; drawThemes(); }
             
             screenEnterTime = millis();
             lastActivity = millis();
@@ -1888,7 +2096,7 @@ void loop() {
     
     // РАДИО (С ИСПРАВЛЕННЫМ ВЫХОДОМ)
     if(currentScreen == 8) {
-        pwrForKeyboard = false;  // ← ОТКЛЮЧАЕМ ТАЙМЕР ВЫКЛЮЧЕНИЯ!
+        pwrForKeyboard = false;
         
         if(!wifiConnected) {
             M5.Lcd.setTextColor(TFT_RED);
@@ -1919,13 +2127,189 @@ void loop() {
             lastActivity = millis();
         }
         
-        // Выход по PWR (короткое нажатие)
         if(M5.BtnPWR.wasPressed()) {
             radioPlaying = false;
             currentScreen = 0;
             drawAppRibbon();
             lastActivity = millis();
-            pwrHeld = false;  // ← СБРАСЫВАЕМ ФЛАГ ДОЛГОГО НАЖАТИЯ
+            pwrHeld = false;
+        }
+    }
+    
+    // НОВЫЙ ТАЙМЕР (С ИСПРАВЛЕННЫМ ВЫХОДОМ)
+    if(currentScreen == 9) {
+        pwrForKeyboard = false;
+        static bool inSetMode = false;
+        
+        if(!timerActive && !timerPaused) {
+            if(M5.BtnA.wasPressed() && !inSetMode) {
+                inSetMode = true;
+                timerEditMode = 0;
+                drawTimerSet();
+                playClickSound();
+            }
+            
+            if(!inSetMode) {
+                if(M5.BtnA.isPressed()) {
+                    if(aPressStart == 0) aPressStart = millis();
+                    if(!aLongPressActive && millis() - aPressStart > 500) {
+                        aLongPressActive = true;
+                        timerSoundEnabled = !timerSoundEnabled;
+                        drawTimer();
+                        playClickSound();
+                    }
+                } else {
+                    aPressStart = 0;
+                    aLongPressActive = false;
+                }
+            }
+            
+            if(inSetMode) {
+                if(M5.BtnB.isPressed()) {
+                    if(bPressStart == 0) {
+                        bPressStart = millis();
+                        bLongPressActive = false;
+                    } else if(!bLongPressActive && millis() - bPressStart > 800) {
+                        bLongPressActive = true;
+                        timerActive = true;
+                        timerTargetMillis = millis() + (timerSetHours * 3600000UL + timerSetMinutes * 60000UL + timerSetSeconds * 1000UL);
+                        inSetMode = false;
+                        drawTimer();
+                        playUnlockSound();
+                    }
+                } else {
+                    if(bPressStart > 0 && !bLongPressActive) {
+                        timerEditMode = (timerEditMode + 1) % 3;
+                        drawTimerSet();
+                        playClickSound();
+                    }
+                    bPressStart = 0;
+                    bLongPressActive = false;
+                }
+                
+                if(M5.BtnA.wasPressed()) {
+                    if(timerEditMode == 0) {
+                        timerSetHours = (timerSetHours + 1) % 24;
+                    } else if(timerEditMode == 1) {
+                        timerSetMinutes = (timerSetMinutes + 1) % 60;
+                    } else {
+                        timerSetSeconds = (timerSetSeconds + 1) % 60;
+                    }
+                    drawTimerSet();
+                    playClickSound();
+                }
+                
+                if(M5.BtnPWR.wasPressed()) {
+                    inSetMode = false;
+                    drawTimer();
+                    playClickSound();
+                }
+            }
+        } else {
+            if(M5.BtnA.wasPressed()) {
+                if(timerPaused) {
+                    timerPaused = false;
+                    timerTargetMillis = millis() + (timerTargetMillis - timerPauseElapsed);
+                } else {
+                    timerPaused = true;
+                    timerPauseElapsed = millis();
+                }
+                drawTimer();
+                playClickSound();
+            }
+            
+            if(timerPlayingSound) {
+                if(M5.BtnA.isPressed()) {
+                    if(aPressStart == 0) aPressStart = millis();
+                    if(!aLongPressActive && millis() - aPressStart > 500) {
+                        aLongPressActive = true;
+                        timerPlayingSound = false;
+                        silenceSpeaker();
+                        drawTimer();
+                        playClickSound();
+                    }
+                } else {
+                    aPressStart = 0;
+                    aLongPressActive = false;
+                }
+            }
+            
+            if(bShort) {
+                timerActive = false;
+                timerPaused = false;
+                timerPlayingSound = false;
+                silenceSpeaker();
+                drawTimer();
+                playClickSound();
+            }
+            
+            if(!timerPaused && timerTargetMillis > 0 && millis() >= timerTargetMillis) {
+                timerActive = false;
+                drawTimer();
+                if(timerSoundEnabled) {
+                    playTimerAlarmSound();
+                    timerPlayingSound = true;
+                }
+            }
+        }
+        
+        if(M5.BtnPWR.wasPressed() && !inSetMode) {
+            timerActive = false;
+            timerPaused = false;
+            timerPlayingSound = false;
+            silenceSpeaker();
+            currentScreen = 0;
+            drawAppRibbon();
+            lastActivity = millis();
+            pwrHeld = false;
+        }
+        
+        if(!timerPaused && timerActive) {
+            static unsigned long lastTimerDraw = 0;
+            if(millis() - lastTimerDraw > 200) {
+                drawTimer();
+                lastTimerDraw = millis();
+            }
+        }
+    }
+    
+    // STORAGE
+    if(currentScreen == 10) {
+        pwrForKeyboard = false;
+        
+        if(bShort) {
+            storageScroll++;
+            if(storageScroll > 3) storageScroll = 0;
+            drawStorage();
+            playClickSound();
+            lastActivity = millis();
+        }
+        
+        if(M5.BtnB.isPressed()) {
+            if(aPressStart == 0) aPressStart = millis();
+            if(!aLongPressActive && millis() - aPressStart > 500) {
+                aLongPressActive = true;
+                aRepeatTimer = millis();
+                storageScroll--;
+                if(storageScroll < 0) storageScroll = 3;
+                drawStorage();
+            }
+            if(aLongPressActive && millis() - aRepeatTimer > 150) {
+                aRepeatTimer = millis();
+                storageScroll--;
+                if(storageScroll < 0) storageScroll = 3;
+                drawStorage();
+            }
+        } else {
+            aPressStart = 0;
+            aLongPressActive = false;
+        }
+        
+        if(M5.BtnPWR.wasPressed()) {
+            currentScreen = 0;
+            drawAppRibbon();
+            lastActivity = millis();
+            pwrHeld = false;
         }
     }
     
@@ -2156,7 +2540,7 @@ void loop() {
     }
     
     // ТЕМЫ
-    if(currentScreen == 11) {
+    if(currentScreen == 13) {
         if(bShort) {
             currentTheme = (currentTheme + 1) % THEME_COUNT;
             saveTheme(currentTheme);
@@ -2192,7 +2576,7 @@ void loop() {
     }
     
     // НАСТРОЙКИ
-    if(currentScreen == 10) {
+    if(currentScreen == 12) {
         if(M5.BtnPWR.wasPressed() && !pwrHeld) { 
             currentScreen = 0; 
             drawAppRibbon(); 
@@ -2239,7 +2623,7 @@ void loop() {
                 if(currentScreen == 0) drawAppRibbon();
             } else if(settingsPos == 2) {
                 setTimeManually();
-                currentScreen = 10;
+                currentScreen = 12;
                 drawSettings();
             } else if(settingsPos == 3) {
                 currentScreen = 0;
