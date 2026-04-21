@@ -128,7 +128,6 @@
 
 Если тебе понравился проект:
 - Поставь ⭐ звезду на GitHub
-- Подпишись на Telegram-канал [t.me/WinEspAssembler](https://t.me/WinEspAssembler)
 
 ---
 
