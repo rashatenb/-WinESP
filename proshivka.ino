@@ -187,7 +187,7 @@ String powerMenuItems[POWER_MENU_COUNT] = {"Reboot", "Power Off", "Deep Sleep", 
 // Флаг для принудительной перерисовки
 bool needFullRedraw = false;
 
-// ---------- НОВЫЙ ТАЙМЕР ----------
+// ---------- ТАЙМЕР ----------
 RTC_DATA_ATTR unsigned long timerTargetMillis = 0;
 RTC_DATA_ATTR bool timerActive = false;
 RTC_DATA_ATTR int timerSetHours = 0;
@@ -204,9 +204,12 @@ bool sdCardInserted = false;
 uint64_t sdCardSize = 0;
 uint64_t sdCardUsed = 0;
 int storageScroll = 0;
-#define STORAGE_LINES 8
 
-// ---------- НЕБЛОКИРУЮЩИЕ ФУНКЦИИ ЗВУКА (С ГЛУШЕНИЕМ УСИЛИТЕЛЯ) ----------
+// ---------- ЗАЩИТА ОТ ВЫХОДА (для Storage) ----------
+unsigned long exitPressStart = 0;
+bool exitHeld = false;
+
+// ---------- НЕБЛОКИРУЮЩИЕ ФУНКЦИИ ЗВУКА ----------
 void silenceSpeaker() {
     ledcDetach(SPEAKER_PIN);
     pinMode(SPEAKER_PIN, OUTPUT);
@@ -467,7 +470,7 @@ void loadGMTOffset() {
     }
 }
 
-// ---------- ВРЕМЯ (ПРОСТОЕ RTC) ----------
+// ---------- ВРЕМЯ (ПРОСТОЙ RTC + ТОЧНЫЙ millis) ----------
 bool isLeapYear(int year) {
     return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
 }
@@ -856,7 +859,7 @@ void drawRadio() {
     }
 }
 
-// ---------- НОВЫЙ ТАЙМЕР ----------
+// ---------- ТАЙМЕР ----------
 void drawTimerSet() {
     M5.Lcd.fillScreen(TFT_BLACK);
     M5.Lcd.setTextColor(TFT_WHITE);
@@ -951,7 +954,7 @@ void drawTimer() {
     }
 }
 
-// ---------- STORAGE (БЕЗ БАРОВ, ТОЛЬКО ЦИФРЫ) ----------
+// ---------- STORAGE ----------
 void updateSDInfo() {
     sdCardInserted = false;
     if(SD.begin()) {
@@ -973,21 +976,19 @@ void drawStorage() {
     M5.Lcd.setTextSize(1);
     int y = 45;
     
-    if(storageScroll <= 0) {
+    if(storageScroll == 0) {
         M5.Lcd.setCursor(5, y);
         M5.Lcd.println("📦 FLASH: 16 MB total");
         M5.Lcd.setCursor(5, y + 12);
         M5.Lcd.println("   Used: ~4 MB (25%)");
         y += 30;
-    }
-    if(storageScroll <= 1) {
+        
         M5.Lcd.setCursor(5, y);
         M5.Lcd.println("🧠 PSRAM: 8 MB total");
         M5.Lcd.setCursor(5, y + 12);
         M5.Lcd.println("   Used: ~2.4 MB (30%)");
         y += 30;
-    }
-    if(storageScroll <= 2) {
+        
         M5.Lcd.setCursor(5, y);
         M5.Lcd.println("💾 EEPROM: 512 bytes");
         int eepromUsed = 0;
@@ -995,10 +996,8 @@ void drawStorage() {
         M5.Lcd.setCursor(5, y + 12);
         M5.Lcd.println("   Used: " + String(eepromUsed) + " bytes (" + String(eepromUsed * 100 / 512) + "%)");
         y += 30;
-    }
-    
-    updateSDInfo();
-    if(storageScroll <= 3) {
+    } else {
+        updateSDInfo();
         M5.Lcd.setCursor(5, y);
         M5.Lcd.println("📁 SD CARD:");
         if(sdCardInserted) {
@@ -1015,7 +1014,11 @@ void drawStorage() {
     }
     
     M5.Lcd.setCursor(5, 165);
-    M5.Lcd.println("B:Scroll  PWR:Exit");
+    if(storageScroll == 0) {
+        M5.Lcd.println("B: SD Card  Hold A: Exit");
+    } else {
+        M5.Lcd.println("B: Memory  Hold A: Exit");
+    }
 }
 
 // ---------- ЗАСТАВКА ----------
@@ -2094,7 +2097,7 @@ void loop() {
         }
     }
     
-    // РАДИО (С ИСПРАВЛЕННЫМ ВЫХОДОМ)
+    // РАДИО
     if(currentScreen == 8) {
         pwrForKeyboard = false;
         
@@ -2136,7 +2139,7 @@ void loop() {
         }
     }
     
-    // НОВЫЙ ТАЙМЕР (С ИСПРАВЛЕННЫМ ВЫХОДОМ)
+    // ТАЙМЕР
     if(currentScreen == 9) {
         pwrForKeyboard = false;
         static bool inSetMode = false;
@@ -2273,43 +2276,32 @@ void loop() {
         }
     }
     
-    // STORAGE
+    // STORAGE (С ЗАЩИТОЙ ОТ ВЫХОДА)
     if(currentScreen == 10) {
         pwrForKeyboard = false;
         
         if(bShort) {
-            storageScroll++;
-            if(storageScroll > 3) storageScroll = 0;
+            storageScroll = 1 - storageScroll;
             drawStorage();
             playClickSound();
             lastActivity = millis();
         }
         
-        if(M5.BtnB.isPressed()) {
-            if(aPressStart == 0) aPressStart = millis();
-            if(!aLongPressActive && millis() - aPressStart > 500) {
-                aLongPressActive = true;
-                aRepeatTimer = millis();
-                storageScroll--;
-                if(storageScroll < 0) storageScroll = 3;
-                drawStorage();
-            }
-            if(aLongPressActive && millis() - aRepeatTimer > 150) {
-                aRepeatTimer = millis();
-                storageScroll--;
-                if(storageScroll < 0) storageScroll = 3;
-                drawStorage();
+        // Защита от выхода - зажатие A на 1 секунду
+        if(M5.BtnA.isPressed()) {
+            if(exitPressStart == 0) {
+                exitPressStart = millis();
+                exitHeld = false;
+            } else if(!exitHeld && millis() - exitPressStart >= 1000) {
+                exitHeld = true;
+                currentScreen = 0;
+                drawAppRibbon();
+                lastActivity = millis();
+                exitPressStart = 0;
             }
         } else {
-            aPressStart = 0;
-            aLongPressActive = false;
-        }
-        
-        if(M5.BtnPWR.wasPressed()) {
-            currentScreen = 0;
-            drawAppRibbon();
-            lastActivity = millis();
-            pwrHeld = false;
+            exitPressStart = 0;
+            exitHeld = false;
         }
     }
     
@@ -2648,16 +2640,16 @@ void loop() {
         delay(50); 
     }
     
-    // ОБНОВЛЕНИЕ РАБОЧЕГО СТОЛА
+    // ОБНОВЛЕНИЕ РАБОЧЕГО СТОЛА (МГНОВЕННОЕ)
     if(currentScreen == 0) {
         static int lastBat = -1;
-        static int lastMin = -1;
+        static int lastSec = -1;
         int bat = M5.Power.getBatteryLevel();
         auto local = getLocalDateTime();
-        if(bat != lastBat || local.time.minutes != lastMin) { 
+        if(bat != lastBat || local.time.seconds != lastSec) { 
             drawAppRibbon(); 
             lastBat = bat; 
-            lastMin = local.time.minutes; 
+            lastSec = local.time.seconds; 
         }
     }
     
